@@ -756,7 +756,10 @@ impl MessageQueueActor {
         if self.option.fifo() {
             consumer_worker_count = 1;
         }
-        info!("start consumer worker count: {}", consumer_worker_count);
+        debug!(
+            "Start consumer workers, mq={:?}, workerCount={}",
+            self.message_queue, consumer_worker_count
+        );
 
         for _ in 0..consumer_worker_count {
             // create consumer worker
@@ -993,8 +996,9 @@ impl FifoConsumerWorker {
             grouped_messages.entry(group).or_default().push(message);
         }
 
-        info!(
-            "FIFO consume accelerator enabled, message_count={}, group_count={}",
+        // Reference Java: FifoConsumeService#consume logs every batch at DEBUG.
+        debug!(
+            "FifoConsumeService parallel consume, messageViewsNum={}, groupNum={}",
             message_count,
             grouped_messages.len()
         );
@@ -2702,6 +2706,55 @@ mod tests {
             )
             .await;
         assert!(result.is_ok(), "{:?}", result);
+    }
+
+    /// Every received batch goes through the accelerator, so it must not log at `INFO`:
+    /// Java's `FifoConsumeService#consume` logs it at `DEBUG`.
+    #[tokio::test]
+    async fn test_fifo_consume_accelerator_does_not_log_at_info() {
+        let (logs, _guard) = crate::util::test_log::capture();
+        let mut rpc_client = Session::default();
+        rpc_client.expect_receive_message().returning(|_| {
+            Ok(vec![ReceiveMessageResponse {
+                content: Some(Content::Message(new_message())),
+            }])
+        });
+        let consumer_worker =
+            FifoConsumerWorker::new(rpc_client, Arc::new(Box::new(|_| ConsumeResult::SUCCESS)));
+        let consumer_group = Resource {
+            name: "test_group".to_string(),
+            resource_namespace: "".to_string(),
+        };
+        let topic = Resource {
+            name: "test_topic".to_string(),
+            resource_namespace: "".to_string(),
+        };
+        let retry_policy = &BackOffRetryPolicy::Customized(CustomizedBackOffRetryPolicy::new(
+            pb::CustomizedBackoff {
+                next: vec![prost_types::Duration::from_str("0.01s").unwrap()],
+            },
+            1,
+        ));
+        let mut option = PushConsumerOption::default();
+        option.subscribe("test_topic", FilterExpression::new(FilterType::Tag, "*"));
+        option.set_enable_fifo_consume_accelerator(true);
+        let mut session = Session::default();
+        session
+            .expect_shadow_session()
+            .returning(|| Session::default());
+        let mut ack_processor = AckEntryProcessor::new(session, consumer_group, topic, false);
+        let result = ConsumerWorker::Fifo(consumer_worker)
+            .receive_messages(
+                &new_message_queue(),
+                &FilterExpression::sub_all(),
+                &option,
+                &mut ack_processor,
+                retry_policy,
+            )
+            .await;
+        assert!(result.is_ok(), "{:?}", result);
+        assert!(logs.contains("DEBUG", "FifoConsumeService parallel consume"));
+        assert!(!logs.any_at("INFO"));
     }
 
     #[tokio::test]

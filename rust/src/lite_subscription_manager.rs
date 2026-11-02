@@ -26,7 +26,7 @@ use parking_lot::Mutex;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 #[double]
 use crate::client::Client;
@@ -195,11 +195,11 @@ impl LiteSubscriptionManager {
         if let Some(pb::settings::PubSub::Subscription(subscription)) = &settings.pub_sub {
             if let Some(quota) = subscription.lite_subscription_quota {
                 *self.lite_subscription_quota.lock() = quota;
-                info!("Updated lite subscription quota to {}", quota);
+                debug!("Updated lite subscription quota to {}", quota);
             }
             if let Some(max_size) = subscription.max_lite_topic_size {
                 *self.max_lite_topic_size.lock() = max_size;
-                info!("Updated max lite topic size to {}", max_size);
+                debug!("Updated max lite topic size to {}", max_size);
             }
         }
     }
@@ -671,6 +671,21 @@ mod tests {
         );
         assert_eq!(2000, *manager.lite_subscription_quota.lock());
         assert_eq!(128, *manager.max_lite_topic_size.lock());
+    }
+
+    /// The server pushes the settings on every periodic sync, so applying them must not log at
+    /// `INFO`: Java's `LiteSubscriptionManager#sync` logs nothing.
+    #[tokio::test]
+    async fn test_sync_settings_does_not_log_at_info() {
+        let manager = LiteSubscriptionManager::new(
+            create_test_client(),
+            "bind_topic".to_string(),
+            "namespace".to_string(),
+            "group".to_string(),
+        );
+        let (logs, _guard) = crate::util::test_log::capture();
+        manager.sync_settings(&subscription_settings(2000, 128));
+        assert!(!logs.any_at("INFO"));
     }
 
     #[tokio::test]

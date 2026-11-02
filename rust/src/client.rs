@@ -284,6 +284,7 @@ impl Client {
         let route_manager = self.route_manager.clone();
 
         let settings = self.settings.clone();
+        let client_id = self.id.clone();
         tokio::spawn(async move {
             rpc_client.is_started();
             let mut heartbeat_interval = tokio::time::interval(HEART_BEAT_INTERVAL);
@@ -305,8 +306,8 @@ impl Client {
                         let sessions = session_manager.get_all_sessions().await;
                         if let Err(e) = sessions {
                             error!(
-                                "send heartbeat failed: failed to get sessions: {}",
-                                e
+                                "Exception raised during heartbeat, clientId={}, error={}",
+                                client_id, e
                             );
                             continue;
                         }
@@ -315,9 +316,9 @@ impl Client {
                             let peer = session.peer().to_string();
                             let response = Self::heart_beat_inner(session, &group, &namespace, &client_type).await;
                             if let Err(e) = response {
-                                error!(
-                                    "send heartbeat failed: failed to send heartbeat rpc: {}",
-                                    e
+                                warn!(
+                                    "Failed to send heartbeat, endpoints={}, clientId={}, error={}",
+                                    peer, client_id, e
                                 );
                                 // The endpoint did not answer at all. Evict it only after
                                 // the failure threshold is reached so that the next access
@@ -334,9 +335,9 @@ impl Client {
                             let result =
                                 handle_response_status(response.unwrap().status, OPERATION_HEARTBEAT);
                             if let Err(e) = result {
-                                error!(
-                                    "send heartbeat failed: server return error: {}",
-                                    e
+                                warn!(
+                                    "Failed to send heartbeat, endpoints={}, clientId={}, error={}",
+                                    peer, client_id, e
                                 );
                                 heartbeat_failures.remove(&peer);
                                 // A business error such as `cannot find client` means the
@@ -356,7 +357,10 @@ impl Client {
                                 continue;
                             }
                             heartbeat_failures.remove(&peer);
-                            debug!("send heartbeat to server success, peer={}",peer);
+                            debug!(
+                                "Send heartbeat successfully, endpoints={}, clientId={}",
+                                peer, client_id
+                            );
                         }
                     },
                     _ = sync_settings_interval.tick() => {
@@ -435,16 +439,21 @@ impl Client {
                     _ = sync_route_timer.tick() => {
                         let result = route_manager.sync_route_data(&mut rpc_client).await;
                         if let Err(e) = result {
-                            error!("sync route failed: {}", e);
+                            error!(
+                                "Exception raised while updating topic route cache, clientId={}, error={}",
+                                client_id, e
+                            );
                         }
                     },
                     _ = &mut shutdown_rx => {
-                        info!("receive shutdown signal, stop heartbeat and telemetry tasks.");
                         break;
                     }
                 }
             }
-            info!("heartbeat and telemetry task were stopped");
+            info!(
+                "Shutdown the client scheduler successfully, clientId={}",
+                client_id
+            );
         });
         Ok(())
     }

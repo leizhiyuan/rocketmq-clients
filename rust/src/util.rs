@@ -514,6 +514,67 @@ pub fn handle_receive_message_status(
     }
 }
 
+/// Capture the log events emitted by the code under test, so that tests can assert on the
+/// level and the content of what the client logs.
+#[cfg(test)]
+pub(crate) mod test_log {
+    use std::io::Write;
+    use std::sync::{Arc, Mutex};
+
+    use tracing::subscriber::DefaultGuard;
+
+    #[derive(Clone, Default)]
+    pub(crate) struct CapturedLogs(Arc<Mutex<Vec<u8>>>);
+
+    impl CapturedLogs {
+        fn lines(&self) -> Vec<String> {
+            String::from_utf8_lossy(&self.0.lock().unwrap())
+                .lines()
+                .map(str::to_owned)
+                .collect()
+        }
+
+        /// Whether an event at `level` (`"DEBUG"`, `"INFO"`, `"WARN"`, `"ERROR"`) contains
+        /// `needle`.
+        pub(crate) fn contains(&self, level: &str, needle: &str) -> bool {
+            self.lines()
+                .iter()
+                .any(|line| line.trim_start().starts_with(level) && line.contains(needle))
+        }
+
+        /// Whether any event at `level` was emitted.
+        pub(crate) fn any_at(&self, level: &str) -> bool {
+            self.contains(level, "")
+        }
+    }
+
+    impl Write for CapturedLogs {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Capture every event at `DEBUG` or above emitted on the current thread until the
+    /// returned guard is dropped. Tasks spawned on a current-thread runtime are captured too.
+    pub(crate) fn capture() -> (CapturedLogs, DefaultGuard) {
+        let logs = CapturedLogs::default();
+        let writer = logs.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .with_ansi(false)
+            .without_time()
+            .with_target(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        (logs, tracing::subscriber::set_default(subscriber))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::AtomicUsize;

@@ -21,7 +21,7 @@ use std::time::Duration;
 use mockall_double::double;
 use tokio::select;
 use tokio::sync::{mpsc, oneshot};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 #[double]
 use crate::client::Client;
@@ -158,7 +158,7 @@ impl SimpleConsumer {
             }
         }
         info!(
-            "start simple consumer success, client_id: {}",
+            "The rocketmq simple consumer starts successfully, clientId={}",
             self.client.client_id()
         );
         Ok(())
@@ -171,6 +171,7 @@ impl SimpleConsumer {
         let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
         self.shutdown_tx = Some(shutdown_tx);
         let long_polling_timeout = self.client.long_polling_timeout_handle();
+        let client_id = self.client.client_id().to_string();
         tokio::spawn(async move {
             loop {
                 select! {
@@ -180,7 +181,10 @@ impl SimpleConsumer {
                                 Self::apply_server_settings(&settings, &long_polling_timeout);
                             }
                             Some(command) => {
-                                warn!("command {:?} cannot be handled in simple consumer.", command);
+                                warn!(
+                                    "Ignore unexpected command from remote, clientId={}, command={:?}",
+                                    client_id, command
+                                );
                             }
                             // The client was dropped; there is nothing left to handle.
                             None => break,
@@ -193,10 +197,6 @@ impl SimpleConsumer {
                 }
             }
         });
-        info!(
-            "start simple consumer success, client_id: {}",
-            self.client.client_id()
-        );
         Ok(())
     }
 
@@ -224,8 +224,8 @@ impl SimpleConsumer {
                 if seconds > 0 || nanos > 0 {
                     let timeout = Duration::new(seconds as u64, nanos as u32);
                     *long_polling_timeout.write() = timeout;
-                    info!(
-                        "simple consumer applied server-pushed long_polling_timeout: {:?}",
+                    debug!(
+                        "Apply server-pushed long polling timeout, longPollingTimeout={:?}",
                         timeout
                     );
                 }
@@ -441,6 +441,61 @@ mod tests {
             .start()
             .await?;
         Ok(())
+    }
+
+    /// Startup is logged once, with Java's wording (`SimpleConsumerImpl#startUp`).
+    #[tokio::test]
+    async fn simple_consumer_start_logs_once() -> Result<(), ClientError> {
+        let _m = crate::client::tests::MTX.lock();
+        let (logs, _guard) = crate::util::test_log::capture();
+
+        let ctx = Client::new_context();
+        ctx.expect().return_once(|_, _| {
+            let mut client = Client::default();
+            client.expect_start().returning(|_| Ok(()));
+            client
+                .expect_long_polling_timeout_handle()
+                .returning(|| Arc::new(parking_lot::RwLock::new(Duration::from_secs(40))));
+            client
+                .expect_client_id()
+                .return_const("fake_id".to_string());
+            Ok(client)
+        });
+        let mut option = SimpleConsumerOption::default();
+        option.set_consumer_group("test_group");
+        SimpleConsumer::new(option, ClientOption::default())?
+            .start()
+            .await?;
+
+        let started = "The rocketmq simple consumer starts successfully, clientId=fake_id";
+        assert!(logs.contains("INFO", started));
+        assert!(!logs.contains("INFO", "start simple consumer success"));
+        Ok(())
+    }
+
+    /// The server pushes the settings on every periodic sync, so applying them must not log at
+    /// `INFO`: Java's `SimpleSubscriptionSettings#sync` logs nothing.
+    #[test]
+    fn apply_server_settings_does_not_log_at_info() {
+        let (logs, _guard) = crate::util::test_log::capture();
+        let long_polling_timeout = Arc::new(parking_lot::RwLock::new(Duration::from_secs(30)));
+        let settings = crate::pb::Settings {
+            pub_sub: Some(crate::pb::settings::PubSub::Subscription(
+                crate::pb::Subscription {
+                    long_polling_timeout: Some(prost_types::Duration {
+                        seconds: 20,
+                        nanos: 0,
+                    }),
+                    ..Default::default()
+                },
+            )),
+            ..Default::default()
+        };
+
+        SimpleConsumer::apply_server_settings(&settings, &long_polling_timeout);
+
+        assert_eq!(*long_polling_timeout.read(), Duration::from_secs(20));
+        assert!(!logs.any_at("INFO"));
     }
 
     #[tokio::test]

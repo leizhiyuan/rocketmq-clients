@@ -45,7 +45,7 @@ use crate::pb::{
 };
 use crate::util::{PROTOCOL_VERSION, SDK_LANGUAGE, SDK_VERSION};
 use crate::{error::ClientError, pb::messaging_service_client::MessagingServiceClient};
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 const OPERATION_START: &str = "session.start";
 const OPERATION_UPDATE_SETTINGS: &str = "session.update_settings";
@@ -168,6 +168,45 @@ fn now_millis() -> u64 {
     SESSION_ACTIVITY_ORIGIN.elapsed().as_millis() as u64
 }
 
+/// Log a command received from the server, with the same wording as Java's
+/// `ClientSessionImpl#onNext`.
+///
+/// Settings are logged at `DEBUG` rather than Java's `INFO`: the server answers every periodic
+/// settings sync with them, and this client syncs every 30 seconds instead of Java's 5 minutes,
+/// so logging them at `INFO` floods the application log.
+fn log_received_command(command: &Command, peer: &str, client_id: &str) {
+    match command {
+        Command::Settings(_) => debug!(
+            "Receive settings from remote, endpoints={}, clientId={}",
+            peer, client_id
+        ),
+        Command::RecoverOrphanedTransactionCommand(_) => info!(
+            "Receive orphaned transaction recovery command from remote, endpoints={}, clientId={}",
+            peer, client_id
+        ),
+        Command::VerifyMessageCommand(_) => info!(
+            "Receive message verification command from remote, endpoints={}, clientId={}",
+            peer, client_id
+        ),
+        Command::PrintThreadStackTraceCommand(_) => info!(
+            "Receive thread stack print command from remote, endpoints={}, clientId={}",
+            peer, client_id
+        ),
+        Command::ReconnectEndpointsCommand(_) => info!(
+            "Receive reconnect endpoints command from remote, endpoints={}, clientId={}",
+            peer, client_id
+        ),
+        Command::NotifyUnsubscribeLiteCommand(_) => info!(
+            "Receive notify unsubscribe lite command from remote, endpoints={}, clientId={}",
+            peer, client_id
+        ),
+        Command::ThreadStackTrace(_) | Command::VerifyMessageResult(_) => warn!(
+            "Receive unrecognized command from remote, endpoints={}, command={:?}, clientId={}",
+            peer, command, client_id
+        ),
+    }
+}
+
 impl Session {
     const OPERATION_CREATE: &'static str = "session.create_session";
 
@@ -227,7 +266,10 @@ impl Session {
 
         let stub = MessagingServiceClient::new(channel);
 
-        info!("create session success");
+        info!(
+            "Create session successfully, endpoints={}, clientId={}",
+            peer, client_id
+        );
 
         Ok(Session {
             client_id,
@@ -366,8 +408,11 @@ impl Session {
 
         self.establish_telemetry_stream(settings).await?;
 
-        debug!("telemetry_command_tx: {:?}", self.telemetry_command_tx);
-        info!("starting client success");
+        info!(
+            "Start telemetry session successfully, endpoints={}, clientId={}",
+            self.peer(),
+            self.client_id
+        );
         Ok(())
     }
 
@@ -378,7 +423,11 @@ impl Session {
         if let Some(old_shutdown_tx) = self.shutdown_tx.take() {
             // a `send` error means the receiver is already gone, which is fine.
             let _ = old_shutdown_tx.send(());
-            info!("sent shutdown signal to the previous telemetry stream.");
+            info!(
+                "Release the previous telemetry stream, endpoints={}, clientId={}",
+                self.peer(),
+                self.client_id
+            );
         }
 
         let (tx, rx) = mpsc::channel(16);
@@ -410,6 +459,7 @@ impl Session {
         let telemetry_command_tx = self.telemetry_command_tx.as_ref().unwrap().clone();
         let stream_closed_tx = self.stream_closed_tx.clone();
         let peer = self.peer().to_string();
+        let client_id = self.client_id.clone();
         tokio::spawn(async move {
             let mut stream = response.into_inner();
             loop {
@@ -417,13 +467,16 @@ impl Session {
                     message = stream.message() => {
                         match message {
                             Ok(Some(item)) => {
-                                debug!("receive telemetry command: {:?}", item);
                                 if let Some(command) = item.command {
+                                    log_received_command(&command, &peer, &client_id);
                                     _ = telemetry_command_tx.send(command).await;
                                 }
                             }
                             Ok(None) => {
-                                info!("telemetry command stream closed by server");
+                                info!(
+                                    "Receive completion for stream response observer, endpoints={}, clientId={}",
+                                    peer, client_id
+                                );
                                 if let Some(tx) = stream_closed_tx {
                                     // Tell the client layer so that it re-establishes the
                                     // stream right away instead of waiting for the next
@@ -433,7 +486,10 @@ impl Session {
                                 break;
                             }
                             Err(e) => {
-                                error!("telemetry response error: {:?}", e);
+                                error!(
+                                    "Exception raised from stream response observer, endpoints={}, clientId={}, error={:?}",
+                                    peer, client_id, e
+                                );
                                 if let Some(tx) = stream_closed_tx {
                                     let _ = tx.send(peer.clone()).await;
                                 }
@@ -442,7 +498,10 @@ impl Session {
                         }
                     }
                     _ = &mut shutdown_rx => {
-                        info!("receive shutdown signal, stop dealing with telemetry command");
+                        info!(
+                            "Telemetry stream is released, endpoints={}, clientId={}",
+                            peer, client_id
+                        );
                         break;
                     }
                 }
@@ -479,7 +538,11 @@ impl Session {
         &mut self,
         settings: TelemetryCommand,
     ) -> Result<(), ClientError> {
-        info!("re-establishing telemetry stream, peer={}", self.peer());
+        info!(
+            "Try to renew telemetry stream, endpoints={}, clientId={}",
+            self.peer(),
+            self.client_id
+        );
         self.establish_telemetry_stream(settings).await
     }
 
@@ -895,6 +958,66 @@ mod tests {
     use super::*;
 
     generate!("apache.rocketmq.v2", RocketMQMockServer);
+
+    /// Every command received from the server is logged with its endpoints and client id, like
+    /// Java's `ClientSessionImpl#onNext`. Settings are pushed back on every periodic sync, so
+    /// they are logged at `DEBUG` only.
+    #[test]
+    fn received_telemetry_commands_are_logged_like_java() {
+        let (logs, _guard) = crate::util::test_log::capture();
+        let peer = "127.0.0.1:8081";
+        let client_id = "test_client";
+
+        log_received_command(&Command::Settings(Default::default()), peer, client_id);
+        assert!(logs.contains(
+            "DEBUG",
+            "Receive settings from remote, endpoints=127.0.0.1:8081, clientId=test_client"
+        ));
+        assert!(!logs.any_at("INFO"));
+
+        let cases = [
+            (
+                Command::RecoverOrphanedTransactionCommand(Default::default()),
+                "Receive orphaned transaction recovery command from remote",
+            ),
+            (
+                Command::VerifyMessageCommand(Default::default()),
+                "Receive message verification command from remote",
+            ),
+            (
+                Command::PrintThreadStackTraceCommand(Default::default()),
+                "Receive thread stack print command from remote",
+            ),
+            (
+                Command::ReconnectEndpointsCommand(Default::default()),
+                "Receive reconnect endpoints command from remote",
+            ),
+            (
+                Command::NotifyUnsubscribeLiteCommand(Default::default()),
+                "Receive notify unsubscribe lite command from remote",
+            ),
+        ];
+        for (command, message) in cases {
+            log_received_command(&command, peer, client_id);
+            assert!(
+                logs.contains(
+                    "INFO",
+                    &format!("{message}, endpoints=127.0.0.1:8081, clientId=test_client")
+                ),
+                "missing log: {message}"
+            );
+        }
+
+        log_received_command(
+            &Command::ThreadStackTrace(Default::default()),
+            peer,
+            client_id,
+        );
+        assert!(logs.contains(
+            "WARN",
+            "Receive unrecognized command from remote, endpoints=127.0.0.1:8081"
+        ));
+    }
 
     #[tokio::test]
     async fn session_new() {

@@ -156,6 +156,8 @@ impl Producer {
         let rpc_client = self.client.get_session().await?;
         let endpoints = self.client.get_endpoints();
         let producer_option = Arc::clone(&self.option);
+        let client_id = self.client.client_id().to_string();
+        let task_client_id = client_id.clone();
         tokio::spawn(async move {
             loop {
                 select! {
@@ -169,16 +171,23 @@ impl Producer {
                                             &transaction_checker,
                                             endpoints.clone()).await;
                                     if let Err(error) = result {
-                                        error!("handle trannsaction command failed: {:?}", error);
+                                        error!(
+                                            "Exception raised while checking the transaction, clientId={}, error={:?}",
+                                            task_client_id, error
+                                        );
                                     };
                                 }
                                 Settings(command) => {
+                                    // Reference Java: ClientImpl#onSettingsCommand applies the
+                                    // settings silently; the session already logs the receipt.
                                     let option = &mut producer_option.write();
                                     Self::handle_settings_command(command, option);
-                                    info!("handle setting command success.");
                                 }
                                 _ => {
-                                    warn!("unimplemented command {:?}", command);
+                                    warn!(
+                                        "Ignore unexpected command from remote, clientId={}, command={:?}",
+                                        task_client_id, command
+                                    );
                                 }
                             }
                         }
@@ -190,8 +199,8 @@ impl Producer {
             }
         });
         info!(
-            "start producer success, client_id: {}",
-            self.client.client_id()
+            "The rocketmq producer starts successfully, clientId={}",
+            client_id
         );
         Ok(())
     }
@@ -691,6 +700,67 @@ mod tests {
         Producer::new(producer_option, ClientOption::default())?
             .start()
             .await?;
+        Ok(())
+    }
+
+    /// The server pushes the settings on every periodic sync, so applying them must not log at
+    /// `INFO`: Java's `ClientImpl#onSettingsCommand` logs nothing either. Commands the producer
+    /// does not handle are reported like Java's `ClientImpl` does.
+    #[tokio::test]
+    async fn producer_telemetry_command_logs_align_with_java() -> Result<(), ClientError> {
+        let _m = crate::client::tests::MTX.lock();
+        let (logs, _guard) = crate::util::test_log::capture();
+
+        let (command_tx_holder, command_tx_receiver) = std::sync::mpsc::channel();
+        let ctx = Client::new_context();
+        ctx.expect().return_once(move |_, _| {
+            let mut client = Client::default();
+            client.expect_start().return_once(move |tx| {
+                command_tx_holder.send(tx).unwrap();
+                Ok(())
+            });
+            client
+                .expect_client_id()
+                .return_const("fake_id".to_string());
+            client
+                .expect_get_session()
+                .return_once(|| Ok(Session::default()));
+            client
+                .expect_get_endpoints()
+                .return_once(|| Endpoints::from_url("foobar.com:8080").unwrap());
+            Ok(client)
+        });
+        let mut producer = Producer::new(ProducerOption::default(), ClientOption::default())?;
+        producer.start().await?;
+        assert!(logs.contains(
+            "INFO",
+            "The rocketmq producer starts successfully, clientId=fake_id"
+        ));
+
+        let command_tx = command_tx_receiver.recv().unwrap();
+        command_tx
+            .send(Settings(pb::Settings {
+                pub_sub: Some(PubSub::Publishing(pb::Publishing::default())),
+                ..pb::Settings::default()
+            }))
+            .await
+            .unwrap();
+        command_tx
+            .send(pb::telemetry_command::Command::VerifyMessageCommand(
+                pb::VerifyMessageCommand::default(),
+            ))
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        assert!(
+            !logs.contains("INFO", "setting"),
+            "applying settings must not log at INFO"
+        );
+        assert!(logs.contains(
+            "WARN",
+            "Ignore unexpected command from remote, clientId=fake_id"
+        ));
         Ok(())
     }
 
