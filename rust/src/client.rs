@@ -119,9 +119,27 @@ const RECONNECT_RETRY_MAX_DELAY: std::time::Duration = std::time::Duration::from
 
 /// Number of reconnect attempts after a stream-close notification before giving up on the
 /// peer (about two minutes in total with the doubling back-off). After that the endpoint is
-/// considered gone for now: recovery is left to the periodic settings sync, the heartbeat
+/// considered gone for now: recovery is left to the periodic stream check, the heartbeat
 /// and the next business traffic, so a permanently offline endpoint is not probed forever.
 const RECONNECT_MAX_ATTEMPTS: u32 = 8;
+
+/// Initial delay and period of the settings sync. Kept in line with the Java client
+/// (`ClientManagerImpl#SYNC_SETTINGS_DELAY` / `SYNC_SETTINGS_PERIOD`).
+///
+/// The server answers every sync with a `Settings` command on each session, so syncing more
+/// often only adds traffic and log lines: a change pushed by the server reaches the client
+/// through the telemetry stream anyway.
+const SYNC_SETTINGS_DELAY: std::time::Duration = std::time::Duration::from_secs(1);
+const SYNC_SETTINGS_PERIOD: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+
+/// Period of the check that rebuilds broken telemetry streams.
+///
+/// It used to be a side effect of the 30s settings sync. The Java client does not need it,
+/// because `ClientSessionImpl#renewRequestObserver` keeps retrying every second until the
+/// stream is back. The reconnect loop here gives up after [`RECONNECT_MAX_ATTEMPTS`], so this
+/// check keeps an endpoint recoverable after that, without pushing settings to the healthy
+/// sessions.
+const STREAM_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Interval of the periodic topic-route sync.
 ///
@@ -288,9 +306,14 @@ impl Client {
         tokio::spawn(async move {
             rpc_client.is_started();
             let mut heartbeat_interval = tokio::time::interval(HEART_BEAT_INTERVAL);
-            let seconds_30 = std::time::Duration::from_secs(30);
-            let mut sync_settings_interval =
-                tokio::time::interval_at(Instant::now() + seconds_30, seconds_30);
+            let mut sync_settings_interval = tokio::time::interval_at(
+                Instant::now() + SYNC_SETTINGS_DELAY,
+                SYNC_SETTINGS_PERIOD,
+            );
+            let mut stream_check_interval = tokio::time::interval_at(
+                Instant::now() + STREAM_CHECK_INTERVAL,
+                STREAM_CHECK_INTERVAL,
+            );
             let mut sync_route_timer = tokio::time::interval(ROUTE_SYNC_INTERVAL);
             let mut session_cleanup_timer = tokio::time::interval_at(
                 Instant::now() + SESSION_CLEANUP_INTERVAL,
@@ -369,6 +392,9 @@ impl Client {
                         // the client with a new one-off stream on every cycle.
                         session_manager.sync_settings(&settings).await;
                     },
+                    _ = stream_check_interval.tick() => {
+                        session_manager.recover_broken_streams(&settings).await;
+                    },
                     _ = session_cleanup_timer.tick() => {
                         // Keep the session map from growing without bound: drop sessions whose
                         // long-lived connection is gone, or that nobody used for a long time.
@@ -385,7 +411,7 @@ impl Client {
                                 // initial back-off delay, then the delay doubles up to a
                                 // cap, so a permanently offline endpoint is not hammered
                                 // once a second. After the attempt budget is exhausted the
-                                // endpoint is left to the periodic settings sync, the
+                                // endpoint is left to the periodic stream check, the
                                 // heartbeat and the next business traffic.
                                 let session_manager = session_manager.clone();
                                 let settings = settings.clone();
@@ -424,7 +450,7 @@ impl Client {
                                         }
                                     }
                                     error!(
-                                        "gave up reconnecting to peer {} after {} attempts; it will be rebuilt by the periodic settings sync or the next traffic",
+                                        "gave up reconnecting to peer {} after {} attempts; it will be rebuilt by the periodic stream check or the next traffic",
                                         peer, RECONNECT_MAX_ATTEMPTS
                                     );
                                 });
@@ -1246,9 +1272,24 @@ impl SessionManager {
     /// Sessions whose stream cannot be restored are evicted so that `session_map` shrinks
     /// instead of accumulating dead endpoints.
     pub(crate) async fn sync_settings(&self, settings: &TelemetryCommand) {
+        self.update_settings_of_sessions(settings, false).await;
+    }
+
+    /// Rebuild the telemetry stream of every session that lost it, and leave the healthy
+    /// sessions alone.
+    ///
+    /// Sessions whose stream cannot be restored are evicted, like in [`Self::sync_settings`].
+    pub(crate) async fn recover_broken_streams(&self, settings: &TelemetryCommand) {
+        self.update_settings_of_sessions(settings, true).await;
+    }
+
+    async fn update_settings_of_sessions(&self, settings: &TelemetryCommand, broken_only: bool) {
         let mut session_map = self.session_map.lock().await;
         let mut broken: Vec<String> = Vec::new();
         for (endpoint_url, session) in session_map.iter_mut() {
+            if broken_only && session.is_started() {
+                continue;
+            }
             match session.update_settings(settings.clone()).await {
                 Ok(()) => {
                     debug!("sync settings success, peer = {}", endpoint_url);
@@ -2156,6 +2197,75 @@ pub(crate) mod tests {
         );
         // A session whose stream was restored successfully stays registered.
         assert_eq!(session_manager.session_map.lock().await.len(), 1);
+    }
+
+    /// The stream check runs much more often than the settings sync, so it must only rebuild
+    /// broken streams: pushing settings to healthy sessions is the job of the settings sync,
+    /// which runs as rarely as Java's `ClientManagerImpl#SYNC_SETTINGS_PERIOD`.
+    #[tokio::test]
+    async fn test_recover_broken_streams_skips_healthy_sessions() {
+        let session_manager = new_session_manager();
+        let rebuilt = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        {
+            let mut session_map = session_manager.session_map.lock().await;
+            let mut healthy = MockSession::default();
+            healthy.expect_is_started().return_const(true);
+            healthy.expect_update_settings().never();
+            session_map.insert("healthy".to_string(), healthy);
+
+            let mut broken = MockSession::default();
+            broken.expect_is_started().return_const(false);
+            let counter = Arc::clone(&rebuilt);
+            broken
+                .expect_update_settings()
+                .times(1)
+                .returning(move |_| {
+                    counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Ok(())
+                });
+            session_map.insert("broken".to_string(), broken);
+        }
+
+        session_manager
+            .recover_broken_streams(&TelemetryCommand::default())
+            .await;
+
+        assert_eq!(rebuilt.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(session_manager.session_map.lock().await.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_recover_broken_streams_evicts_unrecoverable_session() {
+        let session_manager = new_session_manager();
+        {
+            let mut session_map = session_manager.session_map.lock().await;
+            let mut session = MockSession::default();
+            session.expect_is_started().return_const(false);
+            session.expect_update_settings().returning(|_| {
+                Err(ClientError::new(
+                    ErrorKind::ServerUnavailable,
+                    "server unavailable",
+                    "test.recover_broken_streams",
+                ))
+            });
+            session.expect_shutdown().returning(|| ());
+            session_map.insert("endpoint_a".to_string(), session);
+        }
+
+        session_manager
+            .recover_broken_streams(&TelemetryCommand::default())
+            .await;
+
+        assert!(session_manager.session_map.lock().await.is_empty());
+    }
+
+    /// Keep the settings sync on Java's schedule, and the stream check on the cadence the
+    /// recovery used to rely on.
+    #[test]
+    fn settings_sync_and_stream_check_intervals() {
+        assert_eq!(SYNC_SETTINGS_DELAY, std::time::Duration::from_secs(1));
+        assert_eq!(SYNC_SETTINGS_PERIOD, std::time::Duration::from_secs(5 * 60));
+        assert_eq!(STREAM_CHECK_INTERVAL, std::time::Duration::from_secs(30));
     }
 
     #[tokio::test]

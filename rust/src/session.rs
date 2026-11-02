@@ -171,9 +171,9 @@ fn now_millis() -> u64 {
 /// Log a command received from the server, with the same wording as Java's
 /// `ClientSessionImpl#onNext`.
 ///
-/// Settings are logged at `DEBUG` rather than Java's `INFO`: the server answers every periodic
-/// settings sync with them, and this client syncs every 30 seconds instead of Java's 5 minutes,
-/// so logging them at `INFO` floods the application log.
+/// Settings are logged at `DEBUG` rather than Java's `INFO`: the server sends them back for
+/// every settings sync and every rebuilt stream, on every session, so they are the most
+/// frequent command by far and carry nothing a user needs to see.
 fn log_received_command(command: &Command, peer: &str, client_id: &str) {
     match command {
         Command::Settings(_) => debug!(
@@ -960,8 +960,8 @@ mod tests {
     generate!("apache.rocketmq.v2", RocketMQMockServer);
 
     /// Every command received from the server is logged with its endpoints and client id, like
-    /// Java's `ClientSessionImpl#onNext`. Settings are pushed back on every periodic sync, so
-    /// they are logged at `DEBUG` only.
+    /// Java's `ClientSessionImpl#onNext`. Settings are sent back for every sync, so they are
+    /// logged at `DEBUG` only.
     #[test]
     fn received_telemetry_commands_are_logged_like_java() {
         let (logs, _guard) = crate::util::test_log::capture();
